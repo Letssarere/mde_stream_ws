@@ -10,10 +10,11 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image as RosImage
 from cv_bridge import CvBridge
+import tf2_ros
 
 import torch
 import cv2
@@ -92,6 +93,8 @@ class DA3DepthNode(Node):
         self.declare_parameter("pose_topic", "/depth_estimation/pose")
         self.declare_parameter("camera_info_topic", "/depth_estimation/camera_info")
         self.declare_parameter("pose_frame_id", "world")
+        self.declare_parameter("tf_publish", True)
+        self.declare_parameter("tf_child_frame_id", "")
 
         self.input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
         self.output_topic = self.get_parameter("output_topic").get_parameter_value().string_value
@@ -111,6 +114,10 @@ class DA3DepthNode(Node):
             self.get_parameter("camera_info_topic").get_parameter_value().string_value
         )
         self.pose_frame_id = self.get_parameter("pose_frame_id").get_parameter_value().string_value
+        self.tf_publish = self.get_parameter("tf_publish").get_parameter_value().bool_value
+        self.tf_child_frame_id = (
+            self.get_parameter("tf_child_frame_id").get_parameter_value().string_value
+        )
 
         if self.model_variant not in MODEL_ID_MAP:
             raise ValueError(
@@ -134,6 +141,7 @@ class DA3DepthNode(Node):
         self.pub = self.create_publisher(RosImage, self.output_topic, qos_profile_sensor_data)
         self.pose_pub = None
         self.camera_info_pub = None
+        self.tf_broadcaster = None
         if self.pose_capable:
             self.pose_pub = self.create_publisher(
                 PoseStamped, self.pose_topic, qos_profile_sensor_data
@@ -141,12 +149,15 @@ class DA3DepthNode(Node):
             self.camera_info_pub = self.create_publisher(
                 CameraInfo, self.camera_info_topic, qos_profile_sensor_data
             )
+            if self.tf_publish:
+                self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         # State
         self._latest_msg: Optional[RosImage] = None
         self._lock = threading.Lock()
         self._busy = False
         self._warned_pose_unavailable = False
+        self._warned_missing_tf_child = False
 
         # Load model
         self.device = self._resolve_device(self.device_opt)
@@ -159,7 +170,8 @@ class DA3DepthNode(Node):
         self.get_logger().info(
             f"DA3DepthNode started. input={self.input_topic}, output={self.output_topic}, "
             f"fps={self.fps}, model={self.model_variant}, device={self.device}, "
-            f"pose_publish={'on' if self.pose_capable else 'off'}, use_ray_pose={self.use_ray_pose}"
+            f"pose_publish={'on' if self.pose_capable else 'off'}, use_ray_pose={self.use_ray_pose}, "
+            f"tf_publish={'on' if self.tf_broadcaster is not None else 'off'}"
         )
 
     def _resolve_device(self, device_opt: str) -> torch.device:
@@ -256,6 +268,7 @@ class DA3DepthNode(Node):
                     info_msg = self._build_camera_info(intrinsics[0], depth_map.shape, msg)
                     self.pose_pub.publish(pose_msg)
                     self.camera_info_pub.publish(info_msg)
+                    self._maybe_broadcast_tf(c2w, msg)
                 elif not self._warned_pose_unavailable:
                     self.get_logger().warn(
                         "Pose or intrinsics not available; publishing depth only."
@@ -283,16 +296,14 @@ class DA3DepthNode(Node):
         pose = PoseStamped()
         pose.header.stamp = msg.header.stamp
         pose.header.frame_id = self.pose_frame_id
-        R = c2w[:3, :3]
-        t = c2w[:3, 3]
-        qx, qy, qz, qw = self._rotmat_to_quat(R)
+        t, quat = self._pose_from_c2w(c2w)
         pose.pose.position.x = float(t[0])
         pose.pose.position.y = float(t[1])
         pose.pose.position.z = float(t[2])
-        pose.pose.orientation.x = qx
-        pose.pose.orientation.y = qy
-        pose.pose.orientation.z = qz
-        pose.pose.orientation.w = qw
+        pose.pose.orientation.x = quat[0]
+        pose.pose.orientation.y = quat[1]
+        pose.pose.orientation.z = quat[2]
+        pose.pose.orientation.w = quat[3]
         return pose
 
     def _build_camera_info(
@@ -323,6 +334,38 @@ class DA3DepthNode(Node):
             0.0,
         ]
         return info
+
+    def _maybe_broadcast_tf(self, c2w: np.ndarray, msg: RosImage) -> None:
+        if self.tf_broadcaster is None:
+            return
+        child_frame_id = self.tf_child_frame_id or msg.header.frame_id
+        if not child_frame_id:
+            if not self._warned_missing_tf_child:
+                self.get_logger().warn(
+                    "TF child_frame_id is empty; set tf_child_frame_id or provide frame_id in input."
+                )
+                self._warned_missing_tf_child = True
+            return
+
+        t, quat = self._pose_from_c2w(c2w)
+        tf_msg = TransformStamped()
+        tf_msg.header.stamp = msg.header.stamp
+        tf_msg.header.frame_id = self.pose_frame_id
+        tf_msg.child_frame_id = child_frame_id
+        tf_msg.transform.translation.x = float(t[0])
+        tf_msg.transform.translation.y = float(t[1])
+        tf_msg.transform.translation.z = float(t[2])
+        tf_msg.transform.rotation.x = quat[0]
+        tf_msg.transform.rotation.y = quat[1]
+        tf_msg.transform.rotation.z = quat[2]
+        tf_msg.transform.rotation.w = quat[3]
+        self.tf_broadcaster.sendTransform(tf_msg)
+
+    def _pose_from_c2w(self, c2w: np.ndarray) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
+        R = c2w[:3, :3]
+        t = c2w[:3, 3]
+        quat = self._rotmat_to_quat(R)
+        return t, quat
 
     def _rotmat_to_quat(self, R: np.ndarray) -> Tuple[float, float, float, float]:
         trace = float(R[0, 0] + R[1, 1] + R[2, 2])
