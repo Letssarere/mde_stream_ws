@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import os
 import threading
 from typing import Optional, Tuple
@@ -9,6 +10,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
+from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image as RosImage
 from cv_bridge import CvBridge
 
@@ -25,6 +28,7 @@ MODEL_ID_MAP = {
     "DA3-BASE": "depth-anything/da3-base",
     "DA3METRIC-LARGE": "depth-anything/da3metric-large",
 }
+POSE_CAPABLE_MODELS = {"DA3-SMALL", "DA3-BASE"}
 
 
 def _safe_model_dir(cache_dir: str, hf_repo_id: str) -> str:
@@ -84,6 +88,10 @@ class DA3DepthNode(Node):
         self.declare_parameter("process_res", 504)  # DA3 inference default is 504
         self.declare_parameter("process_res_method", "upper_bound_resize")  # DA3 inference default
         self.declare_parameter("publish_encoding", "32FC1")  # 32FC1 recommended for float32 depth
+        self.declare_parameter("use_ray_pose", True)
+        self.declare_parameter("pose_topic", "/depth_estimation/pose")
+        self.declare_parameter("camera_info_topic", "/depth_estimation/camera_info")
+        self.declare_parameter("pose_frame_id", "world")
 
         self.input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
         self.output_topic = self.get_parameter("output_topic").get_parameter_value().string_value
@@ -97,11 +105,23 @@ class DA3DepthNode(Node):
         self.process_res = int(self.get_parameter("process_res").get_parameter_value().integer_value)
         self.process_res_method = self.get_parameter("process_res_method").get_parameter_value().string_value
         self.publish_encoding = self.get_parameter("publish_encoding").get_parameter_value().string_value
+        self.use_ray_pose = self.get_parameter("use_ray_pose").get_parameter_value().bool_value
+        self.pose_topic = self.get_parameter("pose_topic").get_parameter_value().string_value
+        self.camera_info_topic = (
+            self.get_parameter("camera_info_topic").get_parameter_value().string_value
+        )
+        self.pose_frame_id = self.get_parameter("pose_frame_id").get_parameter_value().string_value
 
         if self.model_variant not in MODEL_ID_MAP:
             raise ValueError(
                 f"Invalid model_variant={self.model_variant}. Choose one of {list(MODEL_ID_MAP.keys())}"
             )
+        self.pose_capable = self.model_variant in POSE_CAPABLE_MODELS
+        if not self.pose_capable and self.use_ray_pose:
+            self.get_logger().warn(
+                f"Model {self.model_variant} does not support ray pose; publishing depth only."
+            )
+            self.use_ray_pose = False
 
         # ROS I/O
         self.bridge = CvBridge()
@@ -112,11 +132,21 @@ class DA3DepthNode(Node):
             qos_profile_sensor_data,
         )
         self.pub = self.create_publisher(RosImage, self.output_topic, qos_profile_sensor_data)
+        self.pose_pub = None
+        self.camera_info_pub = None
+        if self.pose_capable:
+            self.pose_pub = self.create_publisher(
+                PoseStamped, self.pose_topic, qos_profile_sensor_data
+            )
+            self.camera_info_pub = self.create_publisher(
+                CameraInfo, self.camera_info_topic, qos_profile_sensor_data
+            )
 
         # State
         self._latest_msg: Optional[RosImage] = None
         self._lock = threading.Lock()
         self._busy = False
+        self._warned_pose_unavailable = False
 
         # Load model
         self.device = self._resolve_device(self.device_opt)
@@ -128,7 +158,8 @@ class DA3DepthNode(Node):
 
         self.get_logger().info(
             f"DA3DepthNode started. input={self.input_topic}, output={self.output_topic}, "
-            f"fps={self.fps}, model={self.model_variant}, device={self.device}"
+            f"fps={self.fps}, model={self.model_variant}, device={self.device}, "
+            f"pose_publish={'on' if self.pose_capable else 'off'}, use_ray_pose={self.use_ray_pose}"
         )
 
     def _resolve_device(self, device_opt: str) -> torch.device:
@@ -186,12 +217,14 @@ class DA3DepthNode(Node):
             cv_rgb = cv2.cvtColor(cv_bgr, cv2.COLOR_BGR2RGB)
 
             # Run DA3 inference (single image -> N=1)
+            use_ray_pose = self.use_ray_pose if self.pose_capable else False
             prediction = self.model.inference(
                 [cv_rgb],
                 export_dir=None,                 # no filesystem export
                 export_format="mini_npz",         # irrelevant when export_dir is None
                 process_res=self.process_res,
                 process_res_method=self.process_res_method,
+                use_ray_pose=use_ray_pose,
             )
 
             depth = prediction.depth  # expected [N,H,W] float32
@@ -214,10 +247,110 @@ class DA3DepthNode(Node):
 
             self.pub.publish(out)
 
+            if self.pose_pub is not None and self.camera_info_pub is not None:
+                extrinsics = prediction.extrinsics
+                intrinsics = prediction.intrinsics
+                if extrinsics is not None and intrinsics is not None:
+                    c2w = self._extract_c2w(extrinsics[0], use_ray_pose)
+                    pose_msg = self._build_pose_msg(c2w, msg)
+                    info_msg = self._build_camera_info(intrinsics[0], depth_map.shape, msg)
+                    self.pose_pub.publish(pose_msg)
+                    self.camera_info_pub.publish(info_msg)
+                elif not self._warned_pose_unavailable:
+                    self.get_logger().warn(
+                        "Pose or intrinsics not available; publishing depth only."
+                    )
+                    self._warned_pose_unavailable = True
+
         except Exception as e:
             self.get_logger().error(f"Inference failed: {e}")
         finally:
             self._busy = False
+
+    def _extract_c2w(self, extr: np.ndarray, use_ray_pose: bool) -> np.ndarray:
+        if extr.shape == (4, 4):
+            extr = extr[:3, :]
+        if use_ray_pose:
+            return extr
+        # w2c -> c2w
+        R = extr[:3, :3]
+        t = extr[:3, 3]
+        R_t = R.T
+        t_c2w = -R_t @ t
+        return np.concatenate([R_t, t_c2w[:, None]], axis=1)
+
+    def _build_pose_msg(self, c2w: np.ndarray, msg: RosImage) -> PoseStamped:
+        pose = PoseStamped()
+        pose.header.stamp = msg.header.stamp
+        pose.header.frame_id = self.pose_frame_id
+        R = c2w[:3, :3]
+        t = c2w[:3, 3]
+        qx, qy, qz, qw = self._rotmat_to_quat(R)
+        pose.pose.position.x = float(t[0])
+        pose.pose.position.y = float(t[1])
+        pose.pose.position.z = float(t[2])
+        pose.pose.orientation.x = qx
+        pose.pose.orientation.y = qy
+        pose.pose.orientation.z = qz
+        pose.pose.orientation.w = qw
+        return pose
+
+    def _build_camera_info(
+        self, intr: np.ndarray, shape: Tuple[int, int], msg: RosImage
+    ) -> CameraInfo:
+        height, width = int(shape[0]), int(shape[1])
+        info = CameraInfo()
+        info.header.stamp = msg.header.stamp
+        info.header.frame_id = msg.header.frame_id
+        info.height = height
+        info.width = width
+        info.distortion_model = "plumb_bob"
+        info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+        info.k = intr.reshape(-1).astype(float).tolist()
+        info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        info.p = [
+            float(intr[0, 0]),
+            0.0,
+            float(intr[0, 2]),
+            0.0,
+            0.0,
+            float(intr[1, 1]),
+            float(intr[1, 2]),
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+        ]
+        return info
+
+    def _rotmat_to_quat(self, R: np.ndarray) -> Tuple[float, float, float, float]:
+        trace = float(R[0, 0] + R[1, 1] + R[2, 2])
+        if trace > 0.0:
+            s = 0.5 / math.sqrt(trace + 1.0)
+            qw = 0.25 / s
+            qx = (R[2, 1] - R[1, 2]) * s
+            qy = (R[0, 2] - R[2, 0]) * s
+            qz = (R[1, 0] - R[0, 1]) * s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = 2.0 * math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            qw = (R[2, 1] - R[1, 2]) / s
+            qx = 0.25 * s
+            qy = (R[0, 1] + R[1, 0]) / s
+            qz = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = 2.0 * math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            qw = (R[0, 2] - R[2, 0]) / s
+            qx = (R[0, 1] + R[1, 0]) / s
+            qy = 0.25 * s
+            qz = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+            qw = (R[1, 0] - R[0, 1]) / s
+            qx = (R[0, 2] + R[2, 0]) / s
+            qy = (R[1, 2] + R[2, 1]) / s
+            qz = 0.25 * s
+        return float(qx), float(qy), float(qz), float(qw)
 
 
 def main():

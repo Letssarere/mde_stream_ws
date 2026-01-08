@@ -20,6 +20,7 @@ setup(
     entry_points={
         "console_scripts": [
             "da3_depth_node = da3_stream.da3_depth_node:main",
+            "da3_pcd_node = da3_stream.da3_pcd_node:main",
         ],
     },
     include_package_data=True,  # <- 중요: MANIFEST.in에 적은 데이터 파일도 설치에 포함
