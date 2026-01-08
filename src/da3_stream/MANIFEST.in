@@ -1,0 +1,4 @@
+recursive-include depth_anything_3 *
+
+global-exclude *.pyc
+global-exclude __pycache__/*
